@@ -4,3 +4,5 @@ sqlalchemy
 pymysql
 python-dotenv
 pandas
+streamlit
+requests

@@ -1,9 +1,14 @@
+
 from fastapi import APIRouter, Depends, HTTPException, Body
 from sqlalchemy.orm import Session
 from sqlalchemy import text, inspect
-from app.database import get_db
 
-router = APIRouter()
+from app.database import get_db
+from app.auth import get_current_user, require_admin
+
+router = APIRouter(
+    dependencies=[Depends(get_current_user)]
+)
 
 ALLOWED_TABLES = [
     "customers", "sellers", "products",
@@ -60,11 +65,13 @@ def search_table(table_name: str, q: str, db: Session = Depends(get_db)):
     return {"records": [dict(row) for row in rows]}
 
 
+# ADMIN ONLY: ADD
 @router.post("/{table_name}")
 def add_record(
     table_name: str,
     data: dict = Body(...),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    admin=Depends(require_admin)
 ):
     columns, _ = get_info(table_name, db)
     values = data.get("values", {})
@@ -83,16 +90,18 @@ def add_record(
         )
         db.commit()
         return {"message": "Record added successfully"}
-    except Exception as e:
+    except Exception:
         db.rollback()
-        raise HTTPException(400, detail=str(e))
+        raise HTTPException(400, "Unable to add record. Check the supplied values.")
 
 
+# ADMIN ONLY: UPDATE
 @router.put("/{table_name}")
 def update_record(
     table_name: str,
     data: dict = Body(...),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    admin=Depends(require_admin)
 ):
     columns, primary_keys = get_info(table_name, db)
 
@@ -121,16 +130,18 @@ def update_record(
         )
         db.commit()
         return {"message": "Update completed", "rows_affected": result.rowcount}
-    except Exception as e:
+    except Exception:
         db.rollback()
-        raise HTTPException(400, detail=str(e))
+        raise HTTPException(400, "Unable to update record. Check the supplied values.")
 
 
+# ADMIN ONLY: DELETE
 @router.delete("/{table_name}")
 def delete_record(
     table_name: str,
     data: dict = Body(...),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    admin=Depends(require_admin)
 ):
     _, primary_keys = get_info(table_name, db)
     keys = data.get("primary_key", {})
@@ -147,6 +158,6 @@ def delete_record(
         )
         db.commit()
         return {"message": "Delete completed", "rows_affected": result.rowcount}
-    except Exception as e:
+    except Exception:
         db.rollback()
-        raise HTTPException(400, detail=str(e))
+        raise HTTPException(400, "Unable to delete record.")

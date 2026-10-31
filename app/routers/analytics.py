@@ -4,8 +4,9 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text
 from datetime import date, datetime, timedelta
 from app.database import get_db
+from app.auth import get_current_user
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(get_current_user)])
 
 # Common filters for order-based analytics
 def get_filters(start_date, end_date, state):

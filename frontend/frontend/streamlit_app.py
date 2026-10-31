@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 import requests
@@ -11,7 +12,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-API_BASE_URL = "http://127.0.0.1:8000"
+API_BASE_URL = "http://127.0.0.1:8001"
 
 TABLES = {
     "Customers": "customers",
@@ -24,24 +25,46 @@ TABLES = {
     "Order Reviews": "order_reviews",
 }
 
-if "logged_in" not in st.session_state:
-    st.session_state.logged_in = False
+# ---------------- SESSION STATE ----------------
+defaults = {
+    "logged_in": False,
+    "access_token": None,
+    "username": None,
+    "role": None,
+}
+
+for key, value in defaults.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
 
 
 # ---------------- API HELPERS ----------------
 def api_request(method, endpoint, **kwargs):
     try:
+        headers = kwargs.pop("headers", {}).copy()
+
+        token = st.session_state.get("access_token")
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+
         response = requests.request(
-            method, API_BASE_URL + endpoint, timeout=60, **kwargs
+            method,
+            API_BASE_URL + endpoint,
+            headers=headers,
+            timeout=60,
+            **kwargs
         )
+
         response.raise_for_status()
         return response.json() if response.content else {}
+
     except requests.exceptions.RequestException as error:
         detail = ""
         try:
             detail = response.json().get("detail", "")
         except Exception:
             pass
+
         st.error(f"API error: {detail or error}")
         return None
 
@@ -50,6 +73,13 @@ def get_api_data(endpoint, params=None):
     return api_request("GET", endpoint, params=params)
 
 
+def logout():
+    for key in defaults:
+        st.session_state[key] = defaults[key]
+    st.rerun()
+
+
+# ---------------- TABLE MANAGER ----------------
 def show_table_manager(label, table_name):
     st.subheader(f"🗂️ {label}")
     st.caption(f"MySQL table: {table_name}")
@@ -65,38 +95,51 @@ def show_table_manager(label, table_name):
     records = table_data.get("records", [])
 
     search = st.text_input("Search records", key=f"search_{table_name}")
+
     if search.strip():
         result = get_api_data(
-            f"/api/tables/{table_name}/search", params={"q": search}
+            f"/api/tables/{table_name}/search",
+            params={"q": search}
         )
         if result is not None:
             records = result.get("records", [])
 
     df = pd.DataFrame(records, columns=columns)
+
     st.caption(f"Showing {len(df)} records (API currently returns up to 100).")
     st.dataframe(df, use_container_width=True, hide_index=True)
 
+    # Viewers can only view and search records.
+    if st.session_state.role != "admin":
+        st.info("Read-only access: only the administrator can modify records.")
+        return
+
     st.divider()
+
     tab_add, tab_edit, tab_delete = st.tabs(
         ["➕ Add Record", "✏️ Edit Record", "🗑️ Delete Record"]
     )
 
     with tab_add:
         with st.form(f"add_form_{table_name}"):
-            st.write("Enter the values for the new record. Leave optional fields blank.")
+            st.write("Enter values for the new record.")
             new_values = {}
+
             for col in columns:
-                value = st.text_input(col, key=f"add_{table_name}_{col}")
-                if value.strip() != "":
+                value = st.text_input(
+                    col,
+                    key=f"add_{table_name}_{col}"
+                )
+                if value.strip():
                     new_values[col] = value.strip()
 
-            add_clicked = st.form_submit_button("Add Record")
-            if add_clicked:
+            if st.form_submit_button("Add Record"):
                 if not new_values:
                     st.warning("Enter at least one value.")
                 else:
                     result = api_request(
-                        "POST", f"/api/tables/{table_name}",
+                        "POST",
+                        f"/api/tables/{table_name}",
                         json={"values": new_values}
                     )
                     if result:
@@ -105,53 +148,62 @@ def show_table_manager(label, table_name):
 
     with tab_edit:
         if not primary_keys:
-            st.warning("This table has no primary key, so safe editing is unavailable.")
+            st.warning("This table has no primary key.")
         elif not records:
             st.info("No records available to edit.")
         else:
-            options = list(range(len(records)))
             selected_index = st.selectbox(
-                "Select record (from the displayed/search results)",
-                options,
+                "Select record",
+                list(range(len(records))),
                 format_func=lambda i: " | ".join(
-                    f"{key}: {records[i].get(key)}" for key in primary_keys
+                    f"{key}: {records[i].get(key)}"
+                    for key in primary_keys
                 ),
                 key=f"edit_select_{table_name}"
             )
+
             selected = records[selected_index]
+
             with st.form(f"edit_form_{table_name}"):
-                st.write("Update the fields below. Primary keys cannot be changed.")
+                st.write("Primary keys cannot be changed.")
                 updated_values = {}
+
                 for col in columns:
                     if col not in primary_keys:
                         old = selected.get(col)
                         default = "" if old is None else str(old)
+
                         updated_values[col] = st.text_input(
-                            col, value=default, key=f"edit_{table_name}_{col}"
+                            col,
+                            value=default,
+                            key=f"edit_{table_name}_{col}"
                         )
 
-                edit_clicked = st.form_submit_button("Save Changes")
-                if edit_clicked:
+                if st.form_submit_button("Save Changes"):
                     payload_values = {
                         k: (v if v != "" else None)
                         for k, v in updated_values.items()
                     }
+
                     result = api_request(
-                        "PUT", f"/api/tables/{table_name}",
+                        "PUT",
+                        f"/api/tables/{table_name}",
                         json={
                             "primary_key": {
-                                key: selected.get(key) for key in primary_keys
+                                key: selected.get(key)
+                                for key in primary_keys
                             },
                             "values": payload_values
                         }
                     )
+
                     if result:
                         st.success("Record updated.")
                         st.rerun()
 
     with tab_delete:
         if not primary_keys:
-            st.warning("This table has no primary key, so safe deletion is unavailable.")
+            st.warning("This table has no primary key.")
         elif not records:
             st.info("No records available to delete.")
         else:
@@ -159,14 +211,24 @@ def show_table_manager(label, table_name):
                 "Select record to delete",
                 list(range(len(records))),
                 format_func=lambda i: " | ".join(
-                    f"{key}: {records[i].get(key)}" for key in primary_keys
+                    f"{key}: {records[i].get(key)}"
+                    for key in primary_keys
                 ),
                 key=f"delete_select_{table_name}"
             )
-            st.warning("Deleting a record is permanent and may be blocked by related records.")
-            if st.button("Delete Selected Record", key=f"delete_btn_{table_name}"):
+
+            st.warning(
+                "Deleting a record is permanent and may be blocked "
+                "by related records."
+            )
+
+            if st.button(
+                "Delete Selected Record",
+                key=f"delete_btn_{table_name}"
+            ):
                 result = api_request(
-                    "DELETE", f"/api/tables/{table_name}",
+                    "DELETE",
+                    f"/api/tables/{table_name}",
                     json={
                         "primary_key": {
                             key: records[delete_index].get(key)
@@ -174,6 +236,7 @@ def show_table_manager(label, table_name):
                         }
                     }
                 )
+
                 if result:
                     st.success("Record deleted.")
                     st.rerun()
@@ -181,22 +244,21 @@ def show_table_manager(label, table_name):
 
 # ---------------- CHART DATA + SVG CHARTS ----------------
 def _collect_arrays(obj, path=""):
-    """Find list values even when an API response nests them inside dictionaries."""
     found = []
+
     if isinstance(obj, dict):
         for key, value in obj.items():
             child_path = f"{path}.{key}" if path else str(key)
             found.extend(_collect_arrays(value, child_path))
+
     elif isinstance(obj, list):
         if all(not isinstance(item, (dict, list)) for item in obj):
             found.append((path.lower(), obj))
-        elif obj and all(isinstance(item, dict) for item in obj):
-            return found
+
     return found
 
 
 def chart_dataframe(payload, label_names, value_names):
-    """Normalize flat, nested, and record-list API responses into chart data."""
     if payload is None:
         return pd.DataFrame()
 
@@ -209,8 +271,8 @@ def chart_dataframe(payload, label_names, value_names):
     if not isinstance(payload, dict):
         return pd.DataFrame()
 
-    # Standard API shape: {"labels": [...], "values": [...]}
     arrays = _collect_arrays(payload)
+
     if not arrays:
         return pd.DataFrame()
 
@@ -224,11 +286,14 @@ def chart_dataframe(payload, label_names, value_names):
         )
 
     label_candidates = [
-        (path, values) for path, values in arrays
+        (path, values)
+        for path, values in arrays
         if values and all(isinstance(v, str) for v in values)
     ]
+
     value_candidates = [
-        (path, values) for path, values in arrays
+        (path, values)
+        for path, values in arrays
         if values and all(
             isinstance(v, (int, float)) and not isinstance(v, bool)
             for v in values
@@ -236,59 +301,74 @@ def chart_dataframe(payload, label_names, value_names):
     ]
 
     if label_candidates and value_candidates:
-        label_candidates.sort(key=lambda item: score(item[0], label_names), reverse=True)
-        value_candidates.sort(key=lambda item: score(item[0], value_names), reverse=True)
+        label_candidates.sort(
+            key=lambda item: score(item[0], label_names),
+            reverse=True
+        )
+        value_candidates.sort(
+            key=lambda item: score(item[0], value_names),
+            reverse=True
+        )
+
         labels = label_candidates[0][1]
         values = value_candidates[0][1]
-        if len(labels) == len(values):
-            return pd.DataFrame({"Label": labels, "Value": values}).set_index("Label")
 
-    # Fallback for a dict of equally sized scalar arrays.
+        if len(labels) == len(values):
+            return pd.DataFrame(
+                {"Label": labels, "Value": values}
+            ).set_index("Label")
+
     flat = {}
+
     for path, values in arrays:
         key = path.split(".")[-1] or f"column_{len(flat) + 1}"
         flat[key] = values
-    try:
-        frame = pd.DataFrame(flat)
-        if not frame.empty:
-            return frame
-    except (ValueError, TypeError):
-        pass
 
-    return pd.DataFrame()
+    try:
+        return pd.DataFrame(flat)
+    except (ValueError, TypeError):
+        return pd.DataFrame()
 
 
 def _format_value(value):
     try:
         value = float(value)
+
         if abs(value) >= 1_000_000:
             return f"{value / 1_000_000:.1f}M"
+
         if abs(value) >= 1_000:
             return f"{value / 1_000:.1f}K"
+
         return f"{value:,.0f}" if value.is_integer() else f"{value:,.1f}"
+
     except (ValueError, TypeError):
         return str(value)
 
 
 def render_svg_chart(title, labels, values, chart_type="bar"):
-    """Draw a transparent SVG chart with neon strokes and glow filters."""
     width, height = 680, 285
     left, right, top, bottom = 62, 18, 24, 58
+
     plot_w = width - left - right
     plot_h = height - top - bottom
 
     numeric_values = [float(v) for v in values]
+
     if not numeric_values:
         st.caption("No chart data available.")
         return
 
     low = min(0.0, min(numeric_values))
     high = max(numeric_values)
+
     if high == low:
         high = low + 1
+
     padding = (high - low) * 0.12
     low -= padding * 0.15
     high += padding
+
     y_min = min(0, low)
     y_max = high
 
@@ -310,14 +390,16 @@ def render_svg_chart(title, labels, values, chart_type="bar"):
         '<feMergeNode in="SourceGraphic"/></feMerge></filter></defs>'
     ]
 
-    # Subtle horizontal grid and y-axis labels.
     for tick in range(5):
         value = y_min + (y_max - y_min) * tick / 4
         y = y_pos(value)
+
         svg.append(
-            f'<line x1="{left}" y1="{y:.1f}" x2="{width-right}" y2="{y:.1f}" '
+            f'<line x1="{left}" y1="{y:.1f}" '
+            f'x2="{width-right}" y2="{y:.1f}" '
             'stroke="rgba(160,190,230,0.16)" stroke-width="1"/>'
         )
+
         svg.append(
             f'<text x="{left-9}" y="{y+4:.1f}" text-anchor="end" '
             'fill="#A9BCD8" font-size="10">'
@@ -326,50 +408,62 @@ def render_svg_chart(title, labels, values, chart_type="bar"):
 
     if chart_type == "line":
         points = " ".join(
-            f"{x_pos(i):.1f},{y_pos(v):.1f}" for i, v in enumerate(numeric_values)
+            f"{x_pos(i):.1f},{y_pos(v):.1f}"
+            for i, v in enumerate(numeric_values)
         )
+
         svg.append(
             f'<polyline points="{points}" fill="none" stroke="#18CFFF" '
             'stroke-width="7" opacity="0.28" filter="url(#neonGlow)" '
             'stroke-linecap="round" stroke-linejoin="round"/>'
         )
+
         svg.append(
             f'<polyline points="{points}" fill="none" stroke="#38E8FF" '
             'stroke-width="3" filter="url(#neonGlow)" '
             'stroke-linecap="round" stroke-linejoin="round"/>'
         )
+
         for i, value in enumerate(numeric_values):
             x, y = x_pos(i), y_pos(value)
+
             svg.append(
                 f'<circle cx="{x:.1f}" cy="{y:.1f}" r="5" fill="#F06CCB" '
                 'stroke="#FFFFFF" stroke-width="1.5" filter="url(#neonGlow)"/>'
             )
+
     else:
         count = len(numeric_values)
         slot = plot_w / max(count, 1)
         bar_w = min(42, slot * 0.58)
         base_y = y_pos(0)
+
         for i, value in enumerate(numeric_values):
             x = left + i * slot + (slot - bar_w) / 2
             y = y_pos(value)
             bar_h = max(1, base_y - y)
+
             svg.append(
                 f'<rect x="{x:.1f}" y="{y:.1f}" width="{bar_w:.1f}" '
                 f'height="{bar_h:.1f}" rx="5" fill="#18CFFF" opacity="0.88" '
                 'filter="url(#neonGlow)"/>'
             )
 
-    # Category labels; thin out long series to avoid overlap.
     step = max(1, math.ceil(len(labels) / 9))
+
     for i, label in enumerate(labels):
         if i % step == 0 or i == len(labels) - 1:
-            x = x_pos(i) if chart_type == "line" else (
-                left + i * (plot_w / max(len(labels), 1)) +
-                (plot_w / max(len(labels), 1)) / 2
+            x = (
+                x_pos(i) if chart_type == "line"
+                else left + i * (plot_w / max(len(labels), 1))
+                + (plot_w / max(len(labels), 1)) / 2
             )
+
             text_label = str(label)
+
             if len(text_label) > 13:
                 text_label = text_label[:12] + "…"
+
             svg.append(
                 f'<text x="{x:.1f}" y="{height-25}" text-anchor="middle" '
                 'fill="#B9C8DF" font-size="10">'
@@ -380,9 +474,13 @@ def render_svg_chart(title, labels, values, chart_type="bar"):
     st.markdown("".join(svg), unsafe_allow_html=True)
 
 
-def show_analytics_chart(title, endpoint, chart_type="bar",
-                         label_names=("labels", "months", "categories", "states", "payment_types"),
-                         value_names=("values", "revenue", "counts", "orders", "scores")):
+def show_analytics_chart(
+    title,
+    endpoint,
+    chart_type="bar",
+    label_names=("labels", "months", "categories", "states", "payment_types"),
+    value_names=("values", "revenue", "counts", "orders", "scores")
+):
     payload = get_api_data(endpoint)
     frame = chart_dataframe(payload, label_names, value_names)
 
@@ -394,28 +492,34 @@ def show_analytics_chart(title, endpoint, chart_type="bar",
         )
         return
 
-    # If the API returns a regular dataframe, use its first column as labels.
     if isinstance(frame.index, pd.RangeIndex):
         if len(frame.columns) >= 2:
             frame = frame.set_index(frame.columns[0])
         elif len(frame.columns) == 1:
             frame.index = frame.iloc[:, 0].astype(str)
-            frame = pd.DataFrame({"Value": frame.iloc[:, 0].values}, index=frame.index)
+            frame = pd.DataFrame(
+                {"Value": frame.iloc[:, 0].values},
+                index=frame.index
+            )
 
     numeric = frame.select_dtypes(include="number")
+
     if numeric.empty:
         st.markdown(
             f'<div class="chart-panel"><div class="chart-heading">{html.escape(title)}</div>'
-            '<div class="chart-empty">The API returned no numeric values for this chart.</div></div>',
+            '<div class="chart-empty">No numeric values for this chart.</div></div>',
             unsafe_allow_html=True
         )
         return
 
-    # Use the first numeric series; the chart layout stays compact and readable.
     series = numeric.iloc[:, 0]
-    labels = [str(x) for x in series.index.tolist()]
-    values = series.tolist()
-    render_svg_chart(title, labels, values, chart_type)
+
+    render_svg_chart(
+        title,
+        [str(x) for x in series.index.tolist()],
+        series.tolist(),
+        chart_type
+    )
 
 
 # ---------------- DESIGN ----------------
@@ -440,6 +544,7 @@ header[data-testid="stHeader"] {
     height: 0;
     visibility: hidden;
 }
+
 #MainMenu, footer { visibility: hidden; }
 
 .block-container {
@@ -452,9 +557,12 @@ header[data-testid="stHeader"] {
 
 section[data-testid="stSidebar"] {
     background: linear-gradient(180deg, #091832, #142B55, #351A49);
-    border-right: 1px solid rgba(24, 207, 255, 0.5);
+    border-right: 1px solid rgba(24,207,255,0.5);
 }
-section[data-testid="stSidebar"] * { font-family: 'Inter', sans-serif; }
+
+section[data-testid="stSidebar"] * {
+    font-family: 'Inter', sans-serif;
+}
 
 div[data-testid="stVerticalBlockBorderWrapper"] {
     background: transparent !important;
@@ -481,6 +589,7 @@ div[data-testid="stVerticalBlockBorderWrapper"] {
     z-index: 0;
     backdrop-filter: blur(2px);
 }
+
 .sticker svg {
     width: 150px;
     height: 150px;
@@ -489,6 +598,7 @@ div[data-testid="stVerticalBlockBorderWrapper"] {
     fill: none;
     filter: drop-shadow(0 0 15px rgba(24,207,255,0.35));
 }
+
 .sticker1 { top: 10%; left: 4%; }
 .sticker2 { top: 36%; right: 4%; }
 .sticker3 { bottom: 5%; left: 42%; }
@@ -501,15 +611,18 @@ div[data-testid="stVerticalBlockBorderWrapper"] {
     font-weight: 700;
     padding: 8px 18px;
 }
+
 .stButton > button:hover, .stFormSubmitButton > button:hover {
     box-shadow: 0 0 18px #18CFFF99;
 }
+
 .stTextInput input {
     background: #102746;
     color: white;
     border: 1px solid #18CFFF;
     border-radius: 9px;
 }
+
 div[data-testid="stMetric"] {
     background: linear-gradient(135deg, rgba(16,45,85,0.62), rgba(66,32,77,0.62));
     border: 1px solid rgba(24,207,255,0.75);
@@ -517,17 +630,21 @@ div[data-testid="stMetric"] {
     padding: 18px;
     box-shadow: 0 0 16px rgba(24,207,255,0.28);
 }
+
 h1 { font-size: 27px !important; font-weight: 700 !important; }
 h2 { font-size: 21px !important; font-weight: 600 !important; }
 h3 { font-size: 17px !important; font-weight: 600 !important; }
-h1, h2, h3 { color: #F4F8FF !important; font-family: 'Inter', sans-serif !important; }
+
+h1, h2, h3 {
+    color: #F4F8FF !important;
+    font-family: 'Inter', sans-serif !important;
+}
 
 div[data-testid="stDataFrame"] {
     border: 1px solid rgba(24,207,255,0.3);
     border-radius: 10px;
 }
 
-/* Transparent chart panels: no black plot background */
 .chart-panel {
     width: 100%;
     box-sizing: border-box;
@@ -540,6 +657,7 @@ div[data-testid="stDataFrame"] {
                 inset 0 0 20px rgba(232,77,173,0.035);
     backdrop-filter: blur(5px);
 }
+
 .chart-heading {
     color: #EAF8FF;
     font-family: 'Inter', sans-serif;
@@ -547,6 +665,7 @@ div[data-testid="stDataFrame"] {
     font-weight: 650;
     padding: 1px 5px 3px;
 }
+
 .chart-empty {
     color: #B9C8DF;
     font-size: 12px;
@@ -563,46 +682,140 @@ sticker_html = """
 <div class="sticker sticker3"><svg viewBox="0 0 24 24">
 <path d="M3 7l9-4 9 4v10l-9 4-9-4z M3 7l9 4 9-4 M12 11v10"/></svg></div>
 """
+
 st.markdown(sticker_html, unsafe_allow_html=True)
 
 
-# ---------------- LOGIN ----------------
+# ---------------- LOGIN AND REGISTRATION ----------------
 if not st.session_state.logged_in:
+
     st.markdown("<br><br><br>", unsafe_allow_html=True)
+
     left, center, right = st.columns([1, 1.5, 1])
+
     with center:
         with st.container(border=True):
+
             st.markdown(
                 "<h1 style='text-align:center;color:#24D5FF;'>OLIST ANALYTICS</h1>",
                 unsafe_allow_html=True
             )
+
             st.markdown(
                 "<p style='text-align:center;color:#F06CCB;'>Brazilian E-Commerce Analytics</p>",
                 unsafe_allow_html=True
             )
-            st.markdown("### Welcome Back")
-            st.write("Administrator Login")
-            with st.form("login_form"):
-                username = st.text_input("Username")
-                password = st.text_input("Password", type="password")
-                submitted = st.form_submit_button("LOGIN", use_container_width=True)
-                if submitted:
-                    if username == "admin" and password == "admin123":
-                        st.session_state.logged_in = True
-                        st.rerun()
-                    else:
-                        st.error("Incorrect username or password.")
+
+            login_tab, register_tab = st.tabs(
+                ["Login", "Register"]
+            )
+
+            with login_tab:
+                st.markdown("### Welcome Back")
+
+                with st.form("login_form"):
+                    username = st.text_input("Username")
+                    password = st.text_input("Password", type="password")
+
+                    submitted = st.form_submit_button(
+                        "LOGIN",
+                        use_container_width=True
+                    )
+
+                    if submitted:
+                        result = api_request(
+                            "POST",
+                            "/api/auth/login",
+                            json={
+                                "username": username,
+                                "password": password
+                            }
+                        )
+
+                        if result and result.get("access_token"):
+                            st.session_state.access_token = result["access_token"]
+                            st.session_state.username = result["username"]
+                            st.session_state.role = result["role"]
+                            st.session_state.logged_in = True
+                            st.rerun()
+
+            with register_tab:
+                st.markdown("### Create an Account")
+                st.caption("New accounts require administrator approval.")
+
+                with st.form("register_form"):
+                    new_username = st.text_input(
+                        "Choose Username",
+                        key="register_username"
+                    )
+
+                    new_password = st.text_input(
+                        "Choose Password",
+                        type="password",
+                        key="register_password"
+                    )
+
+                    confirm_password = st.text_input(
+                        "Confirm Password",
+                        type="password"
+                    )
+
+                    register_clicked = st.form_submit_button(
+                        "REGISTER",
+                        use_container_width=True
+                    )
+
+                    if register_clicked:
+                        if new_password != confirm_password:
+                            st.error("Passwords do not match.")
+
+                        elif len(new_username.strip()) < 3:
+                            st.error("Username must contain at least 3 characters.")
+
+                        elif len(new_password) < 8:
+                            st.error("Password must contain at least 8 characters.")
+
+                        else:
+                            result = api_request(
+                                "POST",
+                                "/api/auth/register",
+                                json={
+                                    "username": new_username,
+                                    "password": new_password
+                                }
+                            )
+
+                            if result:
+                                st.success(
+                                    "Registration submitted. "
+                                    "Wait for administrator approval."
+                                )
+
 
 # ---------------- MAIN APP ----------------
 else:
+
+    # Confirm the session is still valid and the account is approved.
+    current_user = get_api_data("/api/auth/me")
+
+    if not current_user:
+        logout()
+
+    st.session_state.role = current_user["role"]
+    st.session_state.username = current_user["username"]
+
+    is_admin = st.session_state.role == "admin"
+
     with st.sidebar:
         st.markdown("## 💠 OLIST ANALYTICS")
         st.caption("Brazilian E-Commerce Analytics")
         st.divider()
+
         st.markdown("### Company Information")
         st.write("🇧🇷 Country: Brazil")
         st.write("🏢 Olist E-Commerce Dataset")
         st.write("📍 Curitiba, Paraná")
+
         st.divider()
         st.markdown("### Navigation")
 
@@ -611,69 +824,160 @@ else:
             "Database Tables",
             *[f"Table: {name}" for name in TABLES],
             "Reports & Export",
-            "Data Management",
-            "Admin Settings"
         ]
-        page = st.radio("Select a page", pages, label_visibility="collapsed")
+
+        if is_admin:
+            pages += [
+                "Data Management",
+                "Admin Settings"
+            ]
+
+        page = st.radio(
+            "Select a page",
+            pages,
+            label_visibility="collapsed"
+        )
+
         st.divider()
-        st.caption("Logged in as Administrator")
+
+        st.caption(f"Logged in as: {st.session_state.username}")
+        st.caption(
+            "Administrator" if is_admin else "Approved Viewer"
+        )
+
         if st.button("🚪 Logout", use_container_width=True):
-            st.session_state.logged_in = False
-            st.rerun()
+            logout()
 
     st.markdown(
         "<h1 style='color:#24D5FF;'>Olist E-Commerce Analytics</h1>",
         unsafe_allow_html=True
     )
 
+    # ---------------- DASHBOARD ----------------
     if page == "Overview Dashboard":
+
         st.subheader("Overview Dashboard")
         st.write("Olist database administration and business data.")
+
         summary = get_api_data("/api/analytics/summary")
+
         if summary:
             c1, c2, c3, c4, c5 = st.columns(5)
-            c1.metric("Total Revenue", f"R$ {summary['total_revenue']:,.2f}")
-            c2.metric("Total Orders", f"{summary['total_orders']:,}")
-            c3.metric("Average Order Value", f"R$ {summary['avg_order_value']:,.2f}")
-            c4.metric("Average Review Score", f"{summary['avg_review_score']:.2f}/5")
-            c5.metric("Late Deliveries", f"{summary['pct_late_deliveries']:.2f}%")
+
+            c1.metric(
+                "Total Revenue",
+                f"R$ {summary['total_revenue']:,.2f}"
+            )
+
+            c2.metric(
+                "Total Orders",
+                f"{summary['total_orders']:,}"
+            )
+
+            c3.metric(
+                "Average Order Value",
+                f"R$ {summary['avg_order_value']:,.2f}"
+            )
+
+            c4.metric(
+                "Average Review Score",
+                f"{summary['avg_review_score']:.2f}/5"
+            )
+
+            c5.metric(
+                "Late Deliveries",
+                f"{summary['pct_late_deliveries']:.2f}%"
+            )
 
         st.divider()
         st.markdown("### Business Analytics")
-        left, right = st.columns(2)
-        with left:
-            show_analytics_chart("Monthly Revenue", "/api/analytics/revenue-by-month", "line",
-                                 ("labels", "months", "month"), ("values", "revenue", "total_revenue"))
-        with right:
-            show_analytics_chart("Top Product Categories", "/api/analytics/top-categories", "bar",
-                                 ("labels", "categories", "category"), ("values", "counts", "revenue", "orders"))
-        left, right = st.columns(2)
-        with left:
-            show_analytics_chart("Orders by State", "/api/analytics/orders-by-state", "bar",
-                                 ("labels", "states", "state"), ("values", "counts", "orders"))
-        with right:
-            show_analytics_chart("Payment Types", "/api/analytics/payment-types", "bar",
-                                 ("labels", "payment_types", "payment_type"), ("values", "counts", "values"))
-        show_analytics_chart("Review vs Delivery", "/api/analytics/review-vs-delivery", "bar",
-                             ("labels", "delivery_status", "review_scores"), ("values", "counts", "values"))
-        st.info("Use Database Tables in the sidebar to view and manage Olist records.")
 
+        left, right = st.columns(2)
+
+        with left:
+            show_analytics_chart(
+                "Monthly Revenue",
+                "/api/analytics/revenue-by-month",
+                "line",
+                ("labels", "months", "month"),
+                ("values", "revenue", "total_revenue")
+            )
+
+        with right:
+            show_analytics_chart(
+                "Top Product Categories",
+                "/api/analytics/top-categories",
+                "bar",
+                ("labels", "categories", "category"),
+                ("values", "counts", "revenue", "orders")
+            )
+
+        left, right = st.columns(2)
+
+        with left:
+            show_analytics_chart(
+                "Orders by State",
+                "/api/analytics/orders-by-state",
+                "bar",
+                ("labels", "states", "state"),
+                ("values", "counts", "orders")
+            )
+
+        with right:
+            show_analytics_chart(
+                "Payment Types",
+                "/api/analytics/payment-types",
+                "bar",
+                ("labels", "payment_types", "payment_type"),
+                ("values", "counts", "values")
+            )
+
+        show_analytics_chart(
+            "Review vs Delivery",
+            "/api/analytics/review-vs-delivery",
+            "bar",
+            ("labels", "delivery_status", "review_scores"),
+            ("values", "counts", "values")
+        )
+
+        st.info(
+            "Use Database Tables in the sidebar to view Olist records."
+        )
+
+    # ---------------- DATABASE TABLES ----------------
     elif page == "Database Tables":
+
         st.subheader("Database Tables")
-        st.write("Choose a table from the sidebar to view and manage its records.")
+        st.write("Choose a table from the sidebar to view its records.")
+
         for label, table_name in TABLES.items():
             st.write(f"• **{label}** — `{table_name}`")
 
+    # ---------------- INDIVIDUAL TABLES ----------------
     elif page.startswith("Table: "):
+
         label = page.replace("Table: ", "", 1)
         show_table_manager(label, TABLES[label])
 
+    # ---------------- REPORTS ----------------
     elif page == "Reports & Export":
+
         st.subheader("Reports & Export")
+
         summary = get_api_data("/api/analytics/summary")
+
         if summary:
-            report = pd.DataFrame(list(summary.items()), columns=["Metric", "Value"])
-            st.dataframe(report, use_container_width=True, hide_index=True)
+            report = pd.DataFrame(
+                list(summary.items()),
+                columns=["Metric", "Value"]
+            )
+
+            st.dataframe(
+                report,
+                use_container_width=True,
+                hide_index=True
+            )
+
             st.download_button(
                 "Download Summary CSV",
                 report.to_csv(index=False).encode("utf-8"),
@@ -681,23 +985,109 @@ else:
                 "text/csv"
             )
 
+    # ---------------- DATA MANAGEMENT ----------------
     elif page == "Data Management":
+
+        if not is_admin:
+            st.error("Administrator access required.")
+            st.stop()
+
         st.subheader("Data Management")
-        st.info("Select a table from the sidebar to add, edit, or delete individual records.")
-        st.warning("Bulk CSV-to-MySQL import needs a dedicated backend import endpoint. This page currently previews CSV files only.")
-        uploaded = st.file_uploader("Preview a CSV file", type=["csv"])
+
+        st.info(
+            "Select a table from the sidebar to add, edit, "
+            "or delete individual records."
+        )
+
+        st.warning(
+            "Bulk CSV-to-MySQL import needs a dedicated backend "
+            "import endpoint. This page currently previews CSV files only."
+        )
+
+        uploaded = st.file_uploader(
+            "Preview a CSV file",
+            type=["csv"]
+        )
+
         if uploaded:
             try:
                 csv_df = pd.read_csv(uploaded)
+
                 st.caption(f"{len(csv_df):,} rows")
-                st.dataframe(csv_df.head(10), use_container_width=True)
+
+                st.dataframe(
+                    csv_df.head(10),
+                    use_container_width=True
+                )
+
             except Exception as error:
                 st.error(f"Could not read CSV: {error}")
 
+    # ---------------- ADMIN SETTINGS ----------------
     elif page == "Admin Settings":
+
+        if not is_admin:
+            st.error("Administrator access required.")
+            st.stop()
+
         st.subheader("Admin Settings")
+
         st.write("Application: Olist E-Commerce Analytics")
         st.write("Database: ecommerce_analytics")
         st.write("Backend: FastAPI")
         st.write("Frontend: Streamlit")
-        st.info("Independent analytics project using the public Olist Brazilian e-commerce dataset.")
+
+        st.divider()
+        st.markdown("### User Approval Management")
+
+        pending = get_api_data("/api/auth/pending-users")
+
+        if pending is not None:
+            users = pending.get("users", [])
+
+            if not users:
+                st.success("There are no pending registration requests.")
+
+            else:
+                for user in users:
+                    username = user["username"]
+
+                    col1, col2, col3 = st.columns([3, 1, 1])
+
+                    with col1:
+                        st.write(f"👤 **{username}**")
+
+                    with col2:
+                        if st.button(
+                            "Approve",
+                            key=f"approve_{username}"
+                        ):
+                            result = api_request(
+                                "POST",
+                                f"/api/auth/approve/{username}"
+                            )
+
+                            if result:
+                                st.success(f"{username} approved.")
+                                st.rerun()
+
+                    with col3:
+                        if st.button(
+                            "Reject",
+                            key=f"reject_{username}"
+                        ):
+                            result = api_request(
+                                "DELETE",
+                                f"/api/auth/reject/{username}"
+                            )
+
+                            if result:
+                                st.success(f"{username} rejected.")
+                                st.rerun()
+
+        st.divider()
+
+        st.info(
+            "Independent analytics project using the public "
+            "Olist Brazilian e-commerce dataset."
+        )
